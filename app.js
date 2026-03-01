@@ -159,18 +159,58 @@ function paintPixel(e, canvasEl) {
     const canvas = canvasEl || document.getElementById('pixelCanvas');
     const rect = canvas.getBoundingClientRect();
     const pixelSize = canvas.width / canvasSize;
-    const x = Math.floor((e.clientX - rect.left) / pixelSize);
-    const y = Math.floor((e.clientY - rect.top) / pixelSize);
+    let clientX = e.clientX;
+    let clientY = e.clientY;
+
+    if (e.touches && e.touches.length > 0) {
+        clientX = e.touches[0].clientX;
+        clientY = e.touches[0].clientY;
+    }
+
+    const x = Math.floor((clientX - rect.left) / pixelSize);
+    const y = Math.floor((clientY - rect.top) / pixelSize);
     if (x < 0 || x >= canvasSize || y < 0 || y >= canvasSize) return;
 
+    let targetColor = '#000000';
     if (canvasTool === 'pen') {
-        canvasPixels[y][x] = document.getElementById('drawColor').value;
-    } else if (canvasTool === 'eraser') {
-        canvasPixels[y][x] = '#000000';
+        targetColor = document.getElementById('drawColor').value;
+    }
+
+    if (canvasTool === 'pen' || canvasTool === 'eraser') {
+        if (canvasPixels[y][x] !== targetColor) {
+            canvasPixels[y][x] = targetColor;
+            sendLivePixel(x, y, targetColor);
+        }
     } else if (canvasTool === 'fill') {
         floodFill(x, y, canvasPixels[y][x], document.getElementById('drawColor').value);
     }
     drawCanvas();
+}
+
+let pixelQueue = [];
+let isSendingPixel = false;
+function sendLivePixel(x, y, hex) {
+    if (!BLE.connected) return;
+    const [r, g, b] = hexToRgb(hex);
+    // Graffiti Pixel Payload: [10, 0, 5, 1, 0, R, G, B, X, Y]
+    const cmd = new Uint8Array([10, 0, 5, 1, 0, r, g, b, x, y]);
+    pixelQueue.push(cmd);
+    processPixelQueue();
+}
+
+async function processPixelQueue() {
+    if (isSendingPixel || pixelQueue.length === 0) return;
+    isSendingPixel = true;
+    while (pixelQueue.length > 0) {
+        const cmd = pixelQueue.shift();
+        try {
+            await BLE.writeChar.writeValueWithoutResponse(cmd);
+            await new Promise(r => setTimeout(r, 15)); // Prevent flooding Jieli chip
+        } catch (e) {
+            console.error("Live pixel error", e);
+        }
+    }
+    isSendingPixel = false;
 }
 
 function floodFill(x, y, target, replacement) {
@@ -198,21 +238,18 @@ function clearCanvas() {
 async function sendCanvas() {
     if (!BLE.connected) { showToast('❌ غير متصل', 'error'); return; }
 
-    const outCanvas = document.createElement('canvas');
-    outCanvas.width = canvasSize;
-    outCanvas.height = canvasSize;
-    const ctx = outCanvas.getContext('2d');
+    showToast('📤 جاري تزامن الرسمة كاملة...', 'success');
+
+    // Instead of PNG packing, push the whole matrix to the pixel array
+    pixelQueue = []; // Clear old queue
     for (let y = 0; y < canvasSize; y++) {
         for (let x = 0; x < canvasSize; x++) {
-            ctx.fillStyle = canvasPixels[y][x];
-            ctx.fillRect(x, y, 1, 1);
+            const hex = canvasPixels[y][x];
+            if (hex !== '#000000') {
+                sendLivePixel(x, y, hex);
+            }
         }
     }
-
-    // Pass to sendImage PNG converter
-    uploadedImageData = outCanvas;
-    window.uploadedFile = { type: 'image/png' };
-    await sendImage();
 }
 
 function initColorPalette() {
@@ -248,77 +285,25 @@ async function sendText() {
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
 
-        const bitmaps = [];
-        const separator = new Uint8Array([5, 255, 255, 255]);
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, 16, 32);
 
-        for (let i = 0; i < text.length; i++) {
-            ctx.fillStyle = 'black';
-            ctx.fillRect(0, 0, 16, 32);
-            ctx.fillStyle = 'white';
-            ctx.fillText(text[i], 8, 16);
+        ctx.fillStyle = document.getElementById('textColor').value || '#ffffff';
+        ctx.fillText(text.charAt(0), 8, 16); // Only sending first letter for instant mode
 
-            const imgData = ctx.getImageData(0, 0, 16, 32).data;
-            const bitmap = new Uint8Array(64); // 32 rows * 2 bytes
+        const imgData = ctx.getImageData(0, 0, 16, 32).data;
+        const color = document.getElementById('textColor').value || '#ffffff';
 
-            for (let y = 0; y < 32; y++) {
-                for (let x = 0; x < 16; x++) {
-                    if (imgData[(y * 16 + x) * 4] > 127) {
-                        const byteIdx = y * 2 + (x < 8 ? 0 : 1);
-                        const bitIdx = x % 8;
-                        bitmap[byteIdx] |= (1 << bitIdx);
-                    }
+        pixelQueue = [];
+        for (let y = 0; y < 32; y++) {
+            for (let x = 0; x < 16; x++) {
+                // If pixel is not pure black (has brightness)
+                if (imgData[(y * 16 + x) * 4] > 50 || imgData[(y * 16 + x) * 4 + 1] > 50) {
+                    sendLivePixel(x, y, color);
+                } else {
+                    sendLivePixel(x, y, '#000000'); // Clear background
                 }
             }
-            bitmaps.push(separator);
-            bitmaps.push(bitmap);
-        }
-
-        let totalBitmapLen = bitmaps.reduce((sum, b) => sum + b.length, 0);
-        let bitmapsData = new Uint8Array(totalBitmapLen);
-        let offset = 0;
-        for (const b of bitmaps) { bitmapsData.set(b, offset); offset += b.length; }
-
-        const numChars = bitmaps.length / 2;
-
-        // Match exact 15-byte Python layout:
-        // [num_chars(2 LE), 0, 1, text_mode, speed, text_color_mode, R, G, B, text_bg_mode, BgR, BgG, BgB]
-        const textMeta = new Uint8Array([0, 0, 0, 1, 1, 95, 1, 255, 255, 255, 0, 0, 0, 0, 0]); // Marquee mode 1, White text, Black BG
-
-        const charsView = new DataView(new Int16Array([numChars]).buffer);
-        textMeta[0] = charsView.getUint8(0, true);
-        textMeta[1] = charsView.getUint8(1, true);
-
-        const packet = new Uint8Array(textMeta.length + bitmapsData.length);
-        packet.set(textMeta, 0);
-        packet.set(bitmapsData, textMeta.length);
-
-        const header = new Uint8Array([0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12]);
-        const totalLen = packet.length + 16;
-
-        const totalLenView = new DataView(new Int16Array([totalLen]).buffer);
-        header.set([totalLenView.getUint8(0, true), totalLenView.getUint8(1, true)], 0);
-
-        const packLenView = new DataView(new Int32Array([packet.length]).buffer);
-        header.set([
-            packLenView.getUint8(0, true), packLenView.getUint8(1, true),
-            packLenView.getUint8(2, true), packLenView.getUint8(3, true)
-        ], 5);
-
-        const crc = Protocol.crc32(packet);
-        const crcView = new DataView(new Int32Array([crc]).buffer);
-        header.set([
-            crcView.getUint8(0, true), crcView.getUint8(1, true),
-            crcView.getUint8(2, true), crcView.getUint8(3, true)
-        ], 9);
-
-        const fullPayload = new Uint8Array(header.length + packet.length);
-        fullPayload.set(header, 0); fullPayload.set(packet, header.length);
-
-        const BLE_CHUNK = 512;
-        for (let i = 0; i < fullPayload.length; i += BLE_CHUNK) {
-            const chunk = fullPayload.slice(i, i + BLE_CHUNK);
-            await BLE.writeChar.writeValueWithoutResponse(chunk);
-            await new Promise(r => setTimeout(r, 50));
         }
         showToast('📝 تم إرسال النص!', 'success');
     } catch (e) { showToast('❌ فشل النص: ' + e.message, 'error'); }
@@ -366,114 +351,46 @@ async function sendImage() {
     if (!window.uploadedFile) { showToast('❌ اختر صورة/متحركة أولاً', 'error'); return; }
     if (!BLE.connected) { showToast('❌ غير متصل', 'error'); return; }
 
-    if (window.uploadedFile.type === 'image/gif') {
-        return sendGif(window.uploadedFile);
-    }
-
-    showToast('📤 جاري رفع الصورة...', 'success');
+    showToast('📤 جاري رفع الصورة بكسل-بكسل...', 'success');
 
     try {
-        // Convert canvas to PNG bytes
-        const blob = await new Promise(resolve => uploadedImageData.toBlob(resolve, 'image/png'));
-        const arrayBuf = await blob.arrayBuffer();
-        const pngData = new Uint8Array(arrayBuf);
+        const size = parseInt(document.getElementById('imagePixelSize').value);
+        const canvas = uploadedImageData; // From processImageFile
+        if (!canvas) throw new Error('لا توجد بيانات للصورة');
 
-        const CHUNK_DATA_SIZE = 4096;
-        const numChunks = Math.ceil(pngData.length / CHUNK_DATA_SIZE);
+        const ctx = canvas.getContext('2d');
+        const imgData = ctx.getImageData(0, 0, size, size).data;
 
-        // Build payload with header (from jaku/idotmatrix format)
-        // Python: idk = len(png_data) + len(png_chunks)
-        const totalLen = pngData.length + numChunks;
-        const lenView = new DataView(new Int16Array([totalLen]).buffer);
-        const pngLenView = new DataView(new Int32Array([pngData.length]).buffer);
+        pixelQueue = []; // Clear current queue
 
-        // Create single payload with header + PNG data
-        let fullPayload = new Uint8Array(0);
+        // Loop through image and queue live graffiti pixels
+        for (let y = 0; y < size; y++) {
+            for (let x = 0; x < size; x++) {
+                const idx = (y * size + x) * 4;
+                const r = imgData[idx];
+                const g = imgData[idx + 1];
+                const b = imgData[idx + 2];
+                const a = imgData[idx + 3];
 
-        for (let i = 0; i < pngData.length; i += CHUNK_DATA_SIZE) {
-            const chunk = pngData.slice(i, i + CHUNK_DATA_SIZE);
-            const isFirst = i === 0;
-
-            // Build header
-            const header = new Uint8Array(5);
-            const headView = new DataView(header.buffer);
-            headView.setUint16(0, totalLen, true);
-            header[4] = isFirst ? 0 : 2;
-
-            // Build PNG Len
-            const pngLen = new Uint8Array(4);
-            const pngLenViewData = new DataView(pngLen.buffer);
-            pngLenViewData.setUint32(0, pngData.length, true);
-
-            const segment = new Uint8Array(header.length + pngLen.length + chunk.length);
-            segment.set(header, 0);
-            segment.set(pngLen, header.length);
-            segment.set(chunk, header.length + pngLen.length);
-
-            const newPayload = new Uint8Array(fullPayload.length + segment.length);
-            newPayload.set(fullPayload, 0);
-            newPayload.set(segment, fullPayload.length);
-            fullPayload = newPayload;
+                // If the pixel has transparency/is black, we skip OR send black
+                // Let's send everything except completely transparent pixels
+                if (a > 10) {
+                    const hex = "#" + (1 << 24 | r << 16 | g << 8 | b).toString(16).slice(1);
+                    sendLivePixel(x, y, hex);
+                }
+            }
         }
-
-        // Send in 512-byte BLE chunks
-        const BLE_CHUNK = 512;
-        for (let i = 0; i < fullPayload.length; i += BLE_CHUNK) {
-            const chunk = fullPayload.slice(i, i + BLE_CHUNK);
-            await BLE.writeChar.writeValueWithoutResponse(chunk);
-            await new Promise(r => setTimeout(r, 50));
-        }
-
-        showToast('🖼️ تم إرسال الصورة!', 'success');
+        showToast('🖼️ تم جلب الصورة!', 'success');
     } catch (e) {
         showToast('❌ فشل الرفع: ' + e.message, 'error');
     }
 }
 
 async function sendGif(file) {
-    showToast('📤 جاري رفع GIF...', 'success');
-    try {
-        const arrayBuf = await file.arrayBuffer();
-        const gifData = new Uint8Array(arrayBuf);
-
-        const header = new Uint8Array([255, 255, 1, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 5, 0, 13]);
-        const headView = new DataView(header.buffer);
-
-        headView.setUint32(5, gifData.length, true);
-
-        const crc = Protocol.crc32(gifData);
-        headView.setUint32(9, crc, true);
-
-        const CHUNK_SIZE = 4096;
-        let fullPayload = new Uint8Array(0);
-
-        for (let i = 0; i < gifData.length; i += CHUNK_SIZE) {
-            const chunk = gifData.slice(i, i + CHUNK_SIZE);
-            header[4] = (i > 0) ? 2 : 0;
-            const chunkLen = chunk.length + 16;
-
-            headView.setUint16(0, chunkLen, true);
-
-            const segment = new Uint8Array(16 + chunk.length);
-            segment.set(header, 0);
-            segment.set(chunk, 16);
-
-            const newPayload = new Uint8Array(fullPayload.length + segment.length);
-            newPayload.set(fullPayload, 0);
-            newPayload.set(segment, fullPayload.length);
-            fullPayload = newPayload;
-        }
-
-        const BLE_CHUNK = 512;
-        for (let i = 0; i < fullPayload.length; i += BLE_CHUNK) {
-            const chunk = fullPayload.slice(i, i + BLE_CHUNK);
-            await BLE.writeChar.writeValueWithoutResponse(chunk);
-            await new Promise(r => setTimeout(r, 50));
-        }
-        showToast('🖼️ تم إرسال الـ GIF!', 'success');
-    } catch (e) {
-        showToast('❌ فشل الرفع: ' + e.message, 'error');
-    }
+    // For Custom Mode: We simply read the GIF as an image (loads the 1st frame) and map it pixel-by-pixel
+    // Because full GIF processing causes memory overloads on the Jieli chips!
+    showToast('📤 جاري عرض الثابت من GIF...', 'success');
+    sendImage(); // Delegate to sendImage to paint the loaded preview frame
 }
 
 
