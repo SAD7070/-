@@ -278,25 +278,38 @@ async function sendText() {
         let offset = 0;
         for (const b of bitmaps) { bitmapsData.set(b, offset); offset += b.length; }
 
-        const numChars = text.length;
-        const textMeta = new Uint8Array([0, 0, 0, 1, 1, 95, 1, 255, 255, 255, 0, 0, 0, 0]); // Marquee mode 1, White text
-        textMeta[0] = numChars & 0xFF;
-        textMeta[1] = (numChars >> 8) & 0xFF;
+        const numChars = bitmaps.length / 2;
+
+        // Match exact 15-byte Python layout:
+        // [num_chars(2 LE), 0, 1, text_mode, speed, text_color_mode, R, G, B, text_bg_mode, BgR, BgG, BgB]
+        const textMeta = new Uint8Array([0, 0, 0, 1, 1, 95, 1, 255, 255, 255, 0, 0, 0, 0, 0]); // Marquee mode 1, White text, Black BG
+
+        const charsView = new DataView(new Int16Array([numChars]).buffer);
+        textMeta[0] = charsView.getUint8(0, true);
+        textMeta[1] = charsView.getUint8(1, true);
 
         const packet = new Uint8Array(textMeta.length + bitmapsData.length);
-        packet.set(textMeta, 0); packet.set(bitmapsData, textMeta.length);
+        packet.set(textMeta, 0);
+        packet.set(bitmapsData, textMeta.length);
 
         const header = new Uint8Array([0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12]);
         const totalLen = packet.length + 16;
-        header[0] = totalLen & 0xFF; header[1] = (totalLen >> 8) & 0xFF;
 
-        const packLen = packet.length;
-        header[5] = packLen & 0xFF; header[6] = (packLen >> 8) & 0xFF;
-        header[7] = (packLen >> 16) & 0xFF; header[8] = (packLen >> 24) & 0xFF;
+        const totalLenView = new DataView(new Int16Array([totalLen]).buffer);
+        header.set([totalLenView.getUint8(0, true), totalLenView.getUint8(1, true)], 0);
+
+        const packLenView = new DataView(new Int32Array([packet.length]).buffer);
+        header.set([
+            packLenView.getUint8(0, true), packLenView.getUint8(1, true),
+            packLenView.getUint8(2, true), packLenView.getUint8(3, true)
+        ], 5);
 
         const crc = Protocol.crc32(packet);
-        header[9] = crc & 0xFF; header[10] = (crc >> 8) & 0xFF;
-        header[11] = (crc >> 16) & 0xFF; header[12] = (crc >> 24) & 0xFF;
+        const crcView = new DataView(new Int32Array([crc]).buffer);
+        header.set([
+            crcView.getUint8(0, true), crcView.getUint8(1, true),
+            crcView.getUint8(2, true), crcView.getUint8(3, true)
+        ], 9);
 
         const fullPayload = new Uint8Array(header.length + packet.length);
         fullPayload.set(header, 0); fullPayload.set(packet, header.length);
@@ -381,16 +394,16 @@ async function sendImage() {
             const chunk = pngData.slice(i, i + CHUNK_DATA_SIZE);
             const isFirst = i === 0;
 
-            const header = new Uint8Array([
-                lenView.getUint8(0, true), lenView.getUint8(1, true),
-                0, 0,
-                isFirst ? 0 : 2
-            ]);
+            // Build header
+            const header = new Uint8Array(5);
+            const headView = new DataView(header.buffer);
+            headView.setUint16(0, totalLen, true);
+            header[4] = isFirst ? 0 : 2;
 
-            const pngLen = new Uint8Array([
-                pngLenView.getUint8(0, true), pngLenView.getUint8(1, true),
-                pngLenView.getUint8(2, true), pngLenView.getUint8(3, true)
-            ]);
+            // Build PNG Len
+            const pngLen = new Uint8Array(4);
+            const pngLenViewData = new DataView(pngLen.buffer);
+            pngLenViewData.setUint32(0, pngData.length, true);
 
             const segment = new Uint8Array(header.length + pngLen.length + chunk.length);
             segment.set(header, 0);
@@ -424,13 +437,12 @@ async function sendGif(file) {
         const gifData = new Uint8Array(arrayBuf);
 
         const header = new Uint8Array([255, 255, 1, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 5, 0, 13]);
+        const headView = new DataView(header.buffer);
 
-        const lenView = new DataView(new Int32Array([gifData.length]).buffer);
-        header.set([lenView.getUint8(0, true), lenView.getUint8(1, true), lenView.getUint8(2, true), lenView.getUint8(3, true)], 5);
+        headView.setUint32(5, gifData.length, true);
 
         const crc = Protocol.crc32(gifData);
-        const crcView = new DataView(new Int32Array([crc]).buffer);
-        header.set([crcView.getUint8(0, true), crcView.getUint8(1, true), crcView.getUint8(2, true), crcView.getUint8(3, true)], 9);
+        headView.setUint32(9, crc, true);
 
         const CHUNK_SIZE = 4096;
         let fullPayload = new Uint8Array(0);
@@ -440,8 +452,7 @@ async function sendGif(file) {
             header[4] = (i > 0) ? 2 : 0;
             const chunkLen = chunk.length + 16;
 
-            const chunkLenView = new DataView(new Int16Array([chunkLen]).buffer);
-            header.set([chunkLenView.getUint8(0, true), chunkLenView.getUint8(1, true)], 0);
+            headView.setUint16(0, chunkLen, true);
 
             const segment = new Uint8Array(16 + chunk.length);
             segment.set(header, 0);
