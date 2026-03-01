@@ -365,13 +365,16 @@ async function sendImage() {
         const arrayBuf = await blob.arrayBuffer();
         const pngData = new Uint8Array(arrayBuf);
 
+        const CHUNK_DATA_SIZE = 4096;
+        const numChunks = Math.ceil(pngData.length / CHUNK_DATA_SIZE);
+
         // Build payload with header (from jaku/idotmatrix format)
-        const totalLen = pngData.length + 1;
+        // Python: idk = len(png_data) + len(png_chunks)
+        const totalLen = pngData.length + numChunks;
         const lenView = new DataView(new Int16Array([totalLen]).buffer);
         const pngLenView = new DataView(new Int32Array([pngData.length]).buffer);
 
         // Create single payload with header + PNG data
-        const CHUNK_DATA_SIZE = 4096;
         let fullPayload = new Uint8Array(0);
 
         for (let i = 0; i < pngData.length; i += CHUNK_DATA_SIZE) {
