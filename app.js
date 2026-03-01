@@ -204,8 +204,8 @@ async function processPixelQueue() {
     while (pixelQueue.length > 0) {
         const cmd = pixelQueue.shift();
         try {
-            await BLE.writeChar.writeValueWithoutResponse(cmd);
-            await new Promise(r => setTimeout(r, 15)); // Prevent flooding Jieli chip
+            await BLE.send(cmd);
+            await new Promise(r => setTimeout(r, 10)); // Prevent flooding Jieli chip
         } catch (e) {
             console.error("Live pixel error", e);
         }
@@ -481,7 +481,7 @@ function debugLog(msg) {
 // Send raw bytes directly via writeValueWithoutResponse
 async function sendRaw(bytes) {
     const data = new Uint8Array(bytes);
-    await BLE.writeChar.writeValueWithoutResponse(data);
+    await BLE.send(data);
 }
 
 async function testColor(r, g, b) {

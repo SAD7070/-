@@ -44,11 +44,19 @@ const BLE = {
         if (!this.device) throw new Error('لم يتم اختيار جهاز');
         this.server = await this.device.gatt.connect();
 
-        // === STEP 1: Try iDotMatrix service FIRST (0x00FA) ===
+        // === STEP 1: Try iDotMatrix service FIRST (0xFA00 / 0x00FA) ===
         try {
-            this.service = await this.server.getPrimaryService(this.IDOT_SERVICE);
-            this.usedService = 'iDotMatrix (0x00FA)';
-            console.log('✅ Found iDotMatrix service: 0x00FA');
+            // Devices usually advertise FA00 for FA02 characteristics
+            try {
+                this.service = await this.server.getPrimaryService(0xfa00);
+                this.usedService = 'iDotMatrix (0xFA00)';
+                console.log('✅ Found iDotMatrix service: 0xFA00');
+            } catch (fa00Err) {
+                console.log('⚠️ 0xFA00 failed, trying 0x00FA...');
+                this.service = await this.server.getPrimaryService(this.IDOT_SERVICE);
+                this.usedService = 'iDotMatrix (0x00FA)';
+                console.log('✅ Found iDotMatrix service: 0x00FA');
+            }
 
             // Get FA02 write characteristic
             this.writeChar = await this.service.getCharacteristic(this.IDOT_WRITE);
